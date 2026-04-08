@@ -1,0 +1,9 @@
+/pulse
+/dist/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+/.terraform/
+infra/.terraform/
+infra/.terraform.lock.hcl
