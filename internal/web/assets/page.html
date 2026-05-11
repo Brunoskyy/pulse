@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{.Title}}: {{.Headline}}</title>
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/refresh.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#services">Skip to services</a>
+<header class="top">
+  <div class="wrap top-inner">
+    <a class="brand" href="/"><img src="/static/logo.svg" alt="" width="28" height="28"><span>{{.Title}}</span></a>
+    <nav aria-label="Machine-readable"><a href="/api/status">JSON</a><a href="/metrics">Metrics</a></nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="banner banner-{{.Overall}}" aria-live="polite">
+    <span class="beacon" aria-hidden="true"></span>
+    <div>
+      <h1>{{.Headline}}</h1>
+      <p>Checked continuously. Updated <time datetime="{{iso .Generated}}">{{when .Generated}}</time>.</p>
+    </div>
+  </section>
+
+  <div id="services">
+  {{range .Groups}}
+  <section class="group" aria-labelledby="g-{{.Name}}">
+    <h2 id="g-{{.Name}}">{{.Name}}</h2>
+    <ul class="checks">
+    {{range .Checks}}
+      <li class="check">
+        <div class="check-head">
+          <div class="name">
+            <span class="dot dot-{{.State}}" aria-hidden="true"></span>
+            <h3>{{.Name}}</h3>
+            <span class="kind">{{.Kind}}</span>
+          </div>
+          <span class="state state-{{.State}}">{{if eq .State "up"}}Operational{{else if eq .State "down"}}Down{{else}}No data yet{{end}}</span>
+        </div>
+        {{if .LastError}}<p class="error">Last probe: {{.LastError}}</p>{{end}}
+        <div class="strip" role="img" aria-label="{{strip .Days}}">
+          {{range .Days}}<span class="day day-{{.Level}}" title="{{daytitle .}}"></span>{{end}}
+        </div>
+        <div class="strip-legend" aria-hidden="true"><span>90 days ago</span><span>Today (UTC)</span></div>
+        <dl class="stats">
+          <div><dt>24 hours</dt><dd>{{pct .Uptime24h}}</dd></div>
+          <div><dt>7 days</dt><dd>{{pct .Uptime7d}}</dd></div>
+          <div><dt>90 days</dt><dd>{{pct .Uptime90d}}</dd></div>
+          <div><dt>p95, 24h</dt><dd>{{ms .P95MS24h}}</dd></div>
+          <div><dt>Last check</dt><dd>{{ms .LatencyMS}}</dd></div>
+        </dl>
+      </li>
+    {{end}}
+    </ul>
+  </section>
+  {{end}}
+  </div>
+
+  <section class="group" aria-labelledby="incidents">
+    <h2 id="incidents">Incidents, last 90 days</h2>
+    {{if .Incidents}}
+    <ol class="incidents">
+      {{range .Incidents}}
+      <li class="incident {{if .Ongoing}}incident-ongoing{{end}}">
+        <div class="incident-head">
+          <strong>{{.CheckName}}</strong>
+          <span class="badge {{if .Ongoing}}badge-ongoing{{else}}badge-resolved{{end}}">{{if .Ongoing}}Ongoing{{else}}Resolved{{end}}</span>
+        </div>
+        <p class="reason">{{if .Reason}}{{.Reason}}{{else}}Unreachable{{end}}</p>
+        <p class="meta"><time datetime="{{iso .StartedAt}}">{{when .StartedAt}}</time> · {{if .Ongoing}}for {{.Duration}} so far{{else}}lasted {{.Duration}}{{end}}</p>
+      </li>
+      {{end}}
+    </ol>
+    {{else}}
+    <p class="empty">No incidents in the last 90 days.</p>
+    {{end}}
+  </section>
+</main>
+
+<footer class="wrap foot">
+  <p>Uptime counts the probes that ran. Time when the monitor itself was not running is shown as no data, not as downtime.</p>
+  <p>Powered by <a href="https://github.com/Brunoskyy/pulse">Pulse</a>.</p>
+</footer>
+</body>
+</html>
