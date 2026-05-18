@@ -1,0 +1,47 @@
+# A starting point. Every field except checks has a default; see README.
+title: Northwind status
+listen: ":8080"
+database: /data/pulse.db
+retention: 2160h   # 90 days
+workers: 16
+
+checks:
+  - name: Public API
+    group: Core
+    kind: http
+    target: https://api.example.com/health
+    interval: 30s
+    timeout: 5s
+    expect_status: [200]
+    expect_contains: '"status":"ok"'
+
+  - name: Checkout
+    group: Core
+    kind: http
+    target: https://shop.example.com/checkout/health
+    fail_after: 2      # page after one minute instead of the default three probes
+
+  - name: Postgres
+    group: Infrastructure
+    kind: tcp
+    target: db.internal.example.com:5432
+    interval: 15s
+
+  - name: DNS
+    group: Infrastructure
+    kind: dns
+    target: example.com
+
+  - name: Certificate
+    group: Infrastructure
+    kind: tls
+    target: example.com:443
+    interval: 1h
+    min_validity: 336h  # 14 days
+
+notifiers:
+  - kind: webhook
+    url: https://hooks.example.com/pulse
+    secret: ${PULSE_WEBHOOK_SECRET}
+  - kind: slack
+    url: ${SLACK_WEBHOOK_URL}
