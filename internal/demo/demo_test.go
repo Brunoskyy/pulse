@@ -21,7 +21,7 @@ func TestBackfillIsDeterministic(t *testing.T) {
 		if err := Backfill(context.Background(), st, DefaultServices(), now); err != nil {
 			t.Fatal(err)
 		}
-		w, _ := st.Summary(context.Background(), "webhooks", now.Add(-91*24*time.Hour), now)
+		w, _ := st.Summary(context.Background(), "webhooks", now.Add(-91*24*time.Hour), now, 10*time.Minute)
 		totals[i] = w.OK
 		list, _ := st.Incidents(context.Background(), now.Add(-91*24*time.Hour), 50)
 		if len(list) != len(history) {

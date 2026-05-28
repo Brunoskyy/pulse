@@ -211,31 +211,47 @@ func (s *Store) Incidents(ctx context.Context, since time.Time, limit int) ([]In
 
 // Window summarises a check over [from, to).
 type Window struct {
-	Total   int
-	OK      int
-	P95     time.Duration
-	HasData bool
+	Total    int           // probes
+	OK       int           // successful probes
+	Observed time.Duration // time covered by probes
+	Up       time.Duration // part of Observed where the probe succeeded
+	P95      time.Duration
+	HasData  bool
 }
 
-// Uptime is the share of probes that succeeded, or -1 when nothing was
-// observed. Periods when Pulse itself was not running are not counted as
-// downtime: no probe, no verdict.
+// Uptime is the share of observed time the check was up, or -1 when nothing
+// was observed.
 func (w Window) Uptime() float64 {
-	if w.Total == 0 {
+	if w.Observed <= 0 {
 		return -1
 	}
-	return float64(w.OK) / float64(w.Total)
+	return float64(w.Up) / float64(w.Observed)
 }
 
-// Summary computes the uptime and p95 latency of successful probes in a window.
-func (s *Store) Summary(ctx context.Context, checkID string, from, to time.Time) (Window, error) {
+// weighted is the core of the uptime maths. Each probe stands for the time
+// until the next probe, so a minute of failures probed every five seconds
+// weighs a minute, not twelve times as much as an hour probed every ten
+// minutes. A probe never stands for more than maxGap: beyond that the
+// monitor was not running, and time nobody looked at is no data, not
+// downtime and not uptime either. The last probe in the window stands for the
+// time up to the end of the window, under the same cap.
+const weighted = `
+SELECT at, ok, MIN(COALESCE(LEAD(at) OVER (ORDER BY at), :to) - at, :cap) AS dur
+FROM results WHERE check_id = :check AND at >= :from AND at < :to`
+
+// Summary computes time-weighted uptime and the p95 latency of successful
+// probes in a window. maxGap is how long one probe may stand for; twice the
+// check's interval is the usual choice.
+func (s *Store) Summary(ctx context.Context, checkID string, from, to time.Time, maxGap time.Duration) (Window, error) {
 	var w Window
+	var observed, up int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(SUM(ok), 0) FROM results WHERE check_id = ? AND at >= ? AND at < ?`,
-		checkID, from.UnixMilli(), to.UnixMilli()).Scan(&w.Total, &w.OK)
+		`SELECT COUNT(*), COALESCE(SUM(ok), 0), COALESCE(SUM(dur), 0), COALESCE(SUM(CASE WHEN ok = 1 THEN dur ELSE 0 END), 0)
+		 FROM (`+weighted+`)`, args(checkID, from, to, maxGap)...).Scan(&w.Total, &w.OK, &observed, &up)
 	if err != nil {
 		return w, err
 	}
+	w.Observed, w.Up = time.Duration(observed)*time.Millisecond, time.Duration(up)*time.Millisecond
 	w.HasData = w.Total > 0
 	if w.OK == 0 {
 		return w, nil
@@ -256,6 +272,13 @@ func (s *Store) Summary(ctx context.Context, checkID string, from, to time.Time)
 	return w, nil
 }
 
+func args(checkID string, from, to time.Time, maxGap time.Duration) []any {
+	return []any{
+		sql.Named("check", checkID), sql.Named("from", from.UnixMilli()),
+		sql.Named("to", to.UnixMilli()), sql.Named("cap", maxGap.Milliseconds()),
+	}
+}
+
 // percentileRank is the 1-based nearest-rank index for percentile p of n values.
 func percentileRank(n int, p float64) int {
 	r := int(p*float64(n) + 0.999999)
@@ -270,15 +293,24 @@ func percentileRank(n int, p float64) int {
 
 // Day is one cell of the 90-day strip.
 type Day struct {
-	Start time.Time
-	Total int
-	OK    int
+	Start    time.Time
+	Observed time.Duration
+	Up       time.Duration
+}
+
+// Uptime is the time-weighted share of the day the check was up, or -1.
+func (d Day) Uptime() float64 {
+	if d.Observed <= 0 {
+		return -1
+	}
+	return float64(d.Up) / float64(d.Observed)
 }
 
 // Days returns one entry per UTC day from the day containing from up to and
-// including the day containing to, oldest first. Days with no probes are
-// present with Total 0, so the strip has no holes.
-func (s *Store) Days(ctx context.Context, checkID string, from, to time.Time) ([]Day, error) {
+// including the day containing to, oldest first, weighted the same way as
+// Summary. Days with no probes are present with nothing observed, so the
+// strip has no holes.
+func (s *Store) Days(ctx context.Context, checkID string, from, to time.Time, maxGap time.Duration) ([]Day, error) {
 	first := from.UTC().Truncate(24 * time.Hour)
 	last := to.UTC().Truncate(24 * time.Hour)
 	n := int(last.Sub(first)/(24*time.Hour)) + 1
@@ -286,23 +318,26 @@ func (s *Store) Days(ctx context.Context, checkID string, from, to time.Time) ([
 	for i := range days {
 		days[i].Start = first.Add(time.Duration(i) * 24 * time.Hour)
 	}
+	end := last.Add(24 * time.Hour)
+	if to.Before(end) {
+		end = to
+	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT at / 86400000 AS day, COUNT(*), SUM(ok) FROM results
-		 WHERE check_id = ? AND at >= ? AND at < ?
-		 GROUP BY day`, checkID, first.UnixMilli(), last.Add(24*time.Hour).UnixMilli())
+		`SELECT at / 86400000 AS day, SUM(dur), SUM(CASE WHEN ok = 1 THEN dur ELSE 0 END)
+		 FROM (`+weighted+`) GROUP BY day`, args(checkID, first, end, maxGap)...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	base := first.UnixMilli() / 86400000
 	for rows.Next() {
-		var day int64
-		var d Day
-		if err := rows.Scan(&day, &d.Total, &d.OK); err != nil {
+		var day, observed, up int64
+		if err := rows.Scan(&day, &observed, &up); err != nil {
 			return nil, err
 		}
 		if i := int(day - base); i >= 0 && i < n {
-			days[i].Total, days[i].OK = d.Total, d.OK
+			days[i].Observed = time.Duration(observed) * time.Millisecond
+			days[i].Up = time.Duration(up) * time.Millisecond
 		}
 	}
 	return days, rows.Err()

@@ -131,6 +131,9 @@ func (f *Fleet) Config(listen, database string) *config.Config {
 		c.Checks = append(c.Checks, config.Check{
 			ID: s.ID, Name: s.Name, Group: s.Group, Kind: config.KindHTTP, Target: s.URL(), Method: "GET",
 			Interval: 5 * time.Second, Timeout: 2 * time.Second, FailAfter: 2, RecoverAfter: 2,
+			// The backfill is one probe every ten minutes; let each of those
+			// keep its ten minutes of weight next to the live five-second ones.
+			MaxGap: 10 * time.Minute,
 		})
 	}
 	return c

@@ -52,8 +52,8 @@ func get(t *testing.T, url string) (*http.Response, string) {
 }
 
 func TestPageRendersAndEscapes(t *testing.T) {
-	evil := config.Check{ID: "api", Name: `<script>alert(1)</script>`, Group: "Core", Kind: config.KindHTTP, FailAfter: 1, RecoverAfter: 1}
-	fine := config.Check{ID: "db", Name: "Database", Group: "Core", Kind: config.KindTCP, FailAfter: 1, RecoverAfter: 1}
+	evil := config.Check{ID: "api", Name: `<script>alert(1)</script>`, Group: "Core", Kind: config.KindHTTP, FailAfter: 1, RecoverAfter: 1, Interval: time.Minute, MaxGap: 2 * time.Minute}
+	fine := config.Check{ID: "db", Name: "Database", Group: "Core", Kind: config.KindTCP, FailAfter: 1, RecoverAfter: 1, Interval: time.Minute, MaxGap: 2 * time.Minute}
 	ts, m := server(t, evil, fine)
 	m.Record(context.Background(), evil, check.Result{CheckID: "api", At: now.Add(-time.Minute), OK: false, Error: `<img src=x onerror=alert(2)>`})
 	m.Record(context.Background(), fine, check.Result{CheckID: "db", At: now.Add(-time.Minute), OK: true})
@@ -75,7 +75,7 @@ func TestPageRendersAndEscapes(t *testing.T) {
 }
 
 func TestStatusJSON(t *testing.T) {
-	c := config.Check{ID: "api", Name: "Public API", Kind: config.KindHTTP, FailAfter: 3, RecoverAfter: 2}
+	c := config.Check{ID: "api", Name: "Public API", Kind: config.KindHTTP, FailAfter: 3, RecoverAfter: 2, Interval: time.Minute, MaxGap: 2 * time.Minute}
 	ts, m := server(t, c)
 	for i := range 10 {
 		m.Record(context.Background(), c, check.Result{CheckID: "api", At: now.Add(-time.Duration(10-i) * time.Minute), OK: i != 4, Latency: time.Duration(10+i) * time.Millisecond})
@@ -86,7 +86,7 @@ func TestStatusJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	row := p.Groups[0].Checks[0]
-	if p.Overall != "operational" || row.State != "up" || row.Uptime24h != 0.9 || len(row.Days) != 90 {
+	if p.Overall != "operational" || row.State != "up" || row.Uptime24h < 0.8999 || row.Uptime24h > 0.9001 || len(row.Days) != 90 {
 		t.Fatalf("json: overall=%s state=%s uptime=%v days=%d", p.Overall, row.State, row.Uptime24h, len(row.Days))
 	}
 	if row.Days[89].Level != "major" || row.Days[0].Level != "none" {

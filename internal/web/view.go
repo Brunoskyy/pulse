@@ -153,7 +153,7 @@ func (s *Server) row(ctx context.Context, c config.Check, now time.Time) (CheckR
 		d   time.Duration
 		dst *float64
 	}{{24 * time.Hour, &row.Uptime24h}, {7 * 24 * time.Hour, &row.Uptime7d}, {90 * 24 * time.Hour, &row.Uptime90d}} {
-		sum, err := s.Store.Summary(ctx, c.ID, now.Add(-w.d), now.Add(time.Millisecond))
+		sum, err := s.Store.Summary(ctx, c.ID, now.Add(-w.d), now.Add(time.Millisecond), c.MaxGap)
 		if err != nil {
 			return row, err
 		}
@@ -162,15 +162,12 @@ func (s *Server) row(ctx context.Context, c config.Check, now time.Time) (CheckR
 			row.P95MS24h = ms(sum.P95)
 		}
 	}
-	days, err := s.Store.Days(ctx, c.ID, now.Add(-89*24*time.Hour), now)
+	days, err := s.Store.Days(ctx, c.ID, now.Add(-89*24*time.Hour), now.Add(time.Millisecond), c.MaxGap)
 	if err != nil {
 		return row, err
 	}
 	for _, d := range days {
-		u := -1.0
-		if d.Total > 0 {
-			u = float64(d.OK) / float64(d.Total)
-		}
+		u := d.Uptime()
 		row.Days = append(row.Days, DayCell{Date: d.Start.Format("2006-01-02"), Uptime: u, Level: Level(u)})
 	}
 	return row, nil

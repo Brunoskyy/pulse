@@ -37,6 +37,11 @@ type Check struct {
 	ExpectContains string `yaml:"expect_contains"`
 	// TLS only: fail when the certificate expires sooner than this.
 	MinValidity time.Duration `yaml:"min_validity"`
+	// MaxGap is the longest stretch one probe can stand for in uptime maths.
+	// Beyond it the monitor was not looking, which is no data. Defaults to
+	// twice the interval; raise it if the interval was once longer and that
+	// history should keep its weight.
+	MaxGap time.Duration `yaml:"max_gap"`
 	// Consecutive failures before an incident opens, and successes before it closes.
 	FailAfter    int `yaml:"fail_after"`
 	RecoverAfter int `yaml:"recover_after"`
@@ -120,6 +125,12 @@ func Parse(raw []byte) (*Config, error) {
 		}
 		if ch.Timeout == 0 {
 			ch.Timeout = 10 * time.Second
+		}
+		if ch.MaxGap == 0 {
+			ch.MaxGap = 2 * ch.Interval
+		}
+		if ch.MaxGap < ch.Interval {
+			errs = append(errs, fmt.Errorf("%s: max_gap cannot be shorter than the interval", where))
 		}
 		if ch.Timeout > ch.Interval {
 			ch.Timeout = ch.Interval

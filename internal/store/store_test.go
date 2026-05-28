@@ -37,15 +37,18 @@ func TestSummaryUptimeAndP95(t *testing.T) {
 	}
 	add(t, s, t0.Add(30*time.Minute), false, 999)
 	add(t, s, t0.Add(31*time.Minute), false, 999)
-	w, err := s.Summary(context.Background(), "api", t0, t0.Add(time.Hour))
+	w, err := s.Summary(context.Background(), "api", t0, t0.Add(time.Hour), 2*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if w.Total != 22 || w.OK != 20 {
 		t.Fatalf("counts: %+v", w)
 	}
-	if got := w.Uptime(); got < 0.909 || got > 0.910 {
-		t.Fatalf("uptime %v, want 20/22", got)
+	// Probes 1..19 stand for a minute each, probe 20 for two (the cap, the
+	// next probe is ten minutes later), the failure at 30 for one and the
+	// failure at 31 for two (cap again, the window ends at 60): 21 of 24.
+	if w.Up != 21*time.Minute || w.Observed != 24*time.Minute || w.Uptime() != 0.875 {
+		t.Fatalf("up %s of %s (%v), want 21m of 24m", w.Up, w.Observed, w.Uptime())
 	}
 	// Nearest rank: ceil(0.95*20) = 19th smallest of the successful probes.
 	if w.P95 != 19*time.Millisecond {
@@ -55,7 +58,7 @@ func TestSummaryUptimeAndP95(t *testing.T) {
 
 func TestSummaryWithNoDataIsUnknownNotDown(t *testing.T) {
 	s := open(t)
-	w, err := s.Summary(context.Background(), "api", t0, t0.Add(time.Hour))
+	w, err := s.Summary(context.Background(), "api", t0, t0.Add(time.Hour), time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,9 +74,31 @@ func TestGapsAreNotDowntime(t *testing.T) {
 		add(t, s, t0.Add(time.Duration(i)*time.Minute), true, 10)
 		add(t, s, t0.Add(25*time.Hour+time.Duration(i)*time.Minute), true, 10)
 	}
-	w, _ := s.Summary(context.Background(), "api", t0, t0.Add(48*time.Hour))
+	w, _ := s.Summary(context.Background(), "api", t0, t0.Add(48*time.Hour), 2*time.Minute)
 	if w.Uptime() != 1 {
 		t.Fatalf("time with no probes counted as downtime: %v", w.Uptime())
+	}
+	if w.Observed > 125*time.Minute {
+		t.Fatalf("the day nobody was looking was counted as observed: %s", w.Observed)
+	}
+}
+
+func TestUptimeIsWeightedByTimeNotBySample(t *testing.T) {
+	s := open(t)
+	// Ten hours of probes every ten minutes, all fine, then one minute of
+	// failures probed every five seconds.
+	for i := range 60 {
+		add(t, s, t0.Add(time.Duration(i)*10*time.Minute), true, 10)
+	}
+	failStart := t0.Add(600 * time.Minute)
+	for i := range 12 {
+		add(t, s, failStart.Add(time.Duration(i)*5*time.Second), false, 10)
+	}
+	end := failStart.Add(time.Minute)
+	w, _ := s.Summary(context.Background(), "api", t0, end, 10*time.Minute)
+	// 600 minutes up, 1 minute down. By sample count it would read 60/72.
+	if got := w.Uptime(); got < 0.998 || got > 0.9984 {
+		t.Fatalf("uptime %v, want 600/601", got)
 	}
 }
 
@@ -82,14 +107,19 @@ func TestDaysHasNoHoles(t *testing.T) {
 	add(t, s, t0.Add(2*time.Hour), true, 10)
 	add(t, s, t0.Add(3*time.Hour), false, 10)
 	add(t, s, t0.Add(2*24*time.Hour+time.Hour), true, 10)
-	days, err := s.Days(context.Background(), "api", t0, t0.Add(3*24*time.Hour))
+	days, err := s.Days(context.Background(), "api", t0, t0.Add(3*24*time.Hour), 2*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(days) != 4 {
 		t.Fatalf("want 4 days (inclusive), got %d", len(days))
 	}
-	if days[0].Total != 2 || days[0].OK != 1 || days[1].Total != 0 || days[2].Total != 1 || days[3].Total != 0 {
+	// Day 0: up for the hour until the failure, then the failure stands for
+	// the two-hour cap.
+	if days[0].Up != time.Hour || days[0].Observed != 3*time.Hour {
+		t.Fatalf("day 0: %+v", days[0])
+	}
+	if days[1].Uptime() != -1 || days[2].Uptime() != 1 || days[3].Uptime() != -1 {
 		t.Fatalf("days: %+v", days)
 	}
 }
@@ -160,7 +190,7 @@ func TestConcurrentWritersDoNotFail(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 20 {
-				if _, err := s.Summary(context.Background(), "api", t0, t0.Add(time.Hour)); err != nil {
+				if _, err := s.Summary(context.Background(), "api", t0, t0.Add(time.Hour), time.Minute); err != nil {
 					errs <- err
 				}
 			}
@@ -173,7 +203,7 @@ func TestConcurrentWritersDoNotFail(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	w, _ := s.Summary(context.Background(), "api", t0, t0.Add(time.Hour))
+	w, _ := s.Summary(context.Background(), "api", t0, t0.Add(time.Hour), time.Minute)
 	if w.Total != 400 {
 		t.Fatalf("lost writes: %d", w.Total)
 	}

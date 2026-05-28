@@ -28,6 +28,9 @@ checks:
 	if api.ID != "public-api" || api.Method != "GET" || api.Interval != 30*time.Second || api.Timeout != 10*time.Second {
 		t.Fatalf("defaults not applied: %+v", api)
 	}
+	if api.MaxGap != time.Minute {
+		t.Fatalf("max_gap should default to twice the interval: %s", api.MaxGap)
+	}
 	if api.FailAfter != 3 || api.RecoverAfter != 2 {
 		t.Fatalf("thresholds: %+v", api)
 	}
