@@ -145,3 +145,84 @@ func TestDispatcherGivesUpAndNeverBlocks(t *testing.T) {
 	cancel() // cuts the hour-long backoff short
 	d.Close()
 }
+
+func TestSlackEscapesWhatTheTargetSent(t *testing.T) {
+	var got map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+	}))
+	defer srv.Close()
+	s := &Slack{URL: srv.URL}
+	err := s.Send(context.Background(), Event{Type: "incident.opened", CheckName: "API <prod> & co", Reason: "<!channel> <https://evil.example|Reset your password>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := got["text"]
+	if strings.ContainsAny(strings.TrimPrefix(text, ":red_circle: "), "<>") {
+		t.Fatalf("unescaped angle brackets reach Slack: %q", text)
+	}
+	if !strings.Contains(text, "API &lt;prod&gt; &amp; co") || !strings.Contains(text, "&lt;!channel&gt;") {
+		t.Fatalf("unexpected text: %q", text)
+	}
+}
+
+type statusSender struct {
+	code  int
+	calls atomic.Int64
+}
+
+func (s *statusSender) Send(context.Context, Event) error {
+	s.calls.Add(1)
+	return &StatusError{Code: s.code}
+}
+
+func TestDispatcherDoesNotRetryPermanentFailures(t *testing.T) {
+	for code, want := range map[int]int64{404: 1, 410: 1, 400: 1, 429: 4, 408: 4, 503: 4} {
+		s := &statusSender{code: code}
+		d := NewDispatcher(slog.New(slog.DiscardHandler), s)
+		d.Backoff = func(int) time.Duration { return time.Millisecond }
+		d.Start(context.Background())
+		d.Notify(Event{Type: "incident.opened"})
+		d.Close()
+		if s.calls.Load() != want {
+			t.Errorf("status %d: %d attempts, want %d", code, s.calls.Load(), want)
+		}
+	}
+	if !Retryable(errors.New("connection reset")) {
+		t.Error("network errors are retryable")
+	}
+}
+
+// stuck never answers until its context is done.
+type stuck struct{ calls atomic.Int64 }
+
+func (s *stuck) Send(ctx context.Context, _ Event) error {
+	s.calls.Add(1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestOneDeadSenderDoesNotDelayTheOthers(t *testing.T) {
+	dead := &stuck{}
+	ok := &flaky{}
+	d := NewDispatcher(slog.New(slog.DiscardHandler), dead, ok)
+	d.Backoff = func(int) time.Duration { return time.Hour }
+	ctx, cancel := context.WithCancel(context.Background())
+	d.Start(ctx)
+	for range 20 {
+		d.Notify(Event{Type: "incident.opened", CheckID: "api"})
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for ok.calls.Load() < 20 {
+		if time.Now().After(deadline) {
+			t.Fatalf("healthy sender got %d of 20 while the other one hung", ok.calls.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	start := time.Now()
+	cancel() // the shutdown deadline: waiting sends and queued events are dropped
+	d.Close()
+	if time.Since(start) > time.Second {
+		t.Fatal("Close did not return promptly once the context was cancelled")
+	}
+}

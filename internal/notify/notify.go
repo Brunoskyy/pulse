@@ -8,11 +8,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -86,17 +88,22 @@ type Slack struct {
 	Client *http.Client
 }
 
+// slackEscape applies Slack's own escaping. The reason comes from whatever
+// the probed target answered, so without this a monitored site could put an
+// @channel ping or a link with a made-up label into the on-call channel.
+var slackEscape = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace
+
 func (s *Slack) Send(ctx context.Context, e Event) error {
 	var text string
 	switch e.Type {
 	case "incident.opened":
-		text = fmt.Sprintf(":red_circle: %s is down: %s", e.CheckName, e.Reason)
+		text = fmt.Sprintf(":red_circle: %s is down: %s", slackEscape(e.CheckName), slackEscape(e.Reason))
 	default:
 		d := time.Duration(0)
 		if e.EndedAt != nil {
 			d = e.EndedAt.Sub(e.StartedAt).Round(time.Second)
 		}
-		text = fmt.Sprintf(":large_green_circle: %s recovered after %s", e.CheckName, d)
+		text = fmt.Sprintf(":large_green_circle: %s recovered after %s", slackEscape(e.CheckName), d)
 	}
 	if e.StatusURL != "" {
 		text += " (" + e.StatusURL + ")"
@@ -121,65 +128,99 @@ func do(c *http.Client, req *http.Request) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("status %d", resp.StatusCode)
+		return &StatusError{Code: resp.StatusCode}
 	}
 	return nil
 }
 
+// StatusError is a receiver answering with something other than 2xx.
+type StatusError struct{ Code int }
+
+func (e *StatusError) Error() string { return fmt.Sprintf("status %d", e.Code) }
+
+// Retryable reports whether trying the same request again could succeed.
+// Network errors, 5xx, 408 and 429 can; any other 4xx (a revoked Slack URL, a
+// receiver that rejects the payload) will fail the same way every time.
+func Retryable(err error) bool {
+	var se *StatusError
+	if !errors.As(err, &se) {
+		return true
+	}
+	return se.Code >= 500 || se.Code == http.StatusRequestTimeout || se.Code == http.StatusTooManyRequests
+}
+
 // Dispatcher sends events in the background so a slow or dead receiver never
-// delays a probe. Each event is retried a few times with backoff; the queue is
-// bounded, and when it is full new events are dropped and logged rather than
-// blocking the monitor.
+// delays a probe. Every sender has its own bounded queue and goroutine, so a
+// Slack URL that blackholes does not hold back the webhook. Each event is
+// retried with backoff while the failure is retryable; when a queue is full
+// new events for that sender are dropped and logged rather than blocking.
 type Dispatcher struct {
 	Senders  []Sender
 	Log      *slog.Logger
 	Attempts int
 	Backoff  func(attempt int) time.Duration
 
-	queue chan Event
-	wg    sync.WaitGroup
-	once  sync.Once
+	queues []chan Event
+	wg     sync.WaitGroup
+	once   sync.Once
+	start  sync.Once
 }
 
+const queueSize = 256
+
 func NewDispatcher(log *slog.Logger, senders ...Sender) *Dispatcher {
-	return &Dispatcher{
+	d := &Dispatcher{
 		Senders:  senders,
 		Log:      log,
 		Attempts: 4,
 		Backoff:  func(a int) time.Duration { return time.Duration(1<<a) * time.Second },
-		queue:    make(chan Event, 256),
 	}
+	for range senders {
+		d.queues = append(d.queues, make(chan Event, queueSize))
+	}
+	return d
 }
 
-// Start runs the delivery goroutine until ctx is done or Close is called.
+// Start runs one delivery goroutine per sender. Retries that are waiting are
+// cut short when ctx is done; events still queued at that point are dropped
+// and counted in the log.
 func (d *Dispatcher) Start(ctx context.Context) {
-	d.wg.Add(1)
-	go func() {
-		defer d.wg.Done()
-		for e := range d.queue {
-			for _, s := range d.Senders {
-				d.deliver(ctx, s, e)
-			}
+	d.start.Do(func() {
+		for i, s := range d.Senders {
+			d.wg.Add(1)
+			go func(s Sender, q chan Event) {
+				defer d.wg.Done()
+				for e := range q {
+					if ctx.Err() != nil {
+						d.Log.Warn("shutting down, notification not sent", "type", e.Type, "check", e.CheckID)
+						continue
+					}
+					d.deliver(ctx, s, e)
+				}
+			}(s, d.queues[i])
 		}
-	}()
+	})
 }
 
-// Notify queues an event without blocking.
+// Notify queues an event for every sender without blocking.
 func (d *Dispatcher) Notify(e Event) {
-	if len(d.Senders) == 0 {
-		return
-	}
-	select {
-	case d.queue <- e:
-	default:
-		d.Log.Warn("notification queue full, dropping event", "type", e.Type, "check", e.CheckID)
+	for _, q := range d.queues {
+		select {
+		case q <- e:
+		default:
+			d.Log.Warn("notification queue full, dropping event", "type", e.Type, "check", e.CheckID)
+		}
 	}
 }
 
-// Close stops accepting events and waits for the queue to drain. Retries that
-// are sleeping are cut short when the Start context is cancelled.
+// Close stops accepting events and waits for the queues to drain, which is
+// bounded by the Start context: cancel it at the shutdown deadline.
 func (d *Dispatcher) Close() {
-	d.once.Do(func() { close(d.queue) })
+	d.once.Do(func() {
+		for _, q := range d.queues {
+			close(q)
+		}
+	})
 	d.wg.Wait()
 }
 
@@ -192,7 +233,7 @@ func (d *Dispatcher) deliver(ctx context.Context, s Sender, e Event) {
 			return
 		}
 		d.Log.Warn("notification failed", "type", e.Type, "check", e.CheckID, "attempt", attempt+1, "err", err)
-		if attempt == d.Attempts-1 {
+		if attempt == d.Attempts-1 || !Retryable(err) {
 			return
 		}
 		select {

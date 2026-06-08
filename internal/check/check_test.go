@@ -2,8 +2,14 @@ package check
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -140,5 +146,87 @@ func TestTLSExpiry(t *testing.T) {
 	r.RootCAs = nil
 	if res := r.Run(context.Background(), config.Check{ID: "tls", Kind: config.KindTLS, Target: c.Target, Timeout: 2 * time.Second, MinValidity: time.Hour}); res.OK {
 		t.Fatal("an untrusted certificate must fail")
+	}
+}
+
+func TestReasonDropsTheRedirectURL(t *testing.T) {
+	// A target that redirects forever to a URL of its choosing. The reason
+	// must not carry that URL, which is what reaches Slack and the page.
+	hostile := "/n?x=<!channel>+<https://evil.example|Reset+your+password>"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, hostile, http.StatusFound)
+	}))
+	defer srv.Close()
+	res := NewRunner().Run(context.Background(), httpCheck(srv.URL))
+	if res.OK {
+		t.Fatal("an endless redirect should fail")
+	}
+	if strings.Contains(res.Error, "channel") || strings.Contains(res.Error, "evil") || strings.Contains(res.Error, "http") {
+		t.Fatalf("reason leaks the redirect target: %q", res.Error)
+	}
+}
+
+// chainServer serves leaf <- intermediate <- root, where the intermediate
+// expires long before the leaf.
+func chainServer(t *testing.T, intermediateLeft time.Duration) (addr string, roots *x509.CertPool) {
+	t.Helper()
+	now := time.Now()
+	mk := func(tmpl, parent *x509.Certificate, pub any, signer any) *x509.Certificate {
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, signer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, _ := x509.ParseCertificate(der)
+		return c
+	}
+	key := func() *ecdsa.PrivateKey {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	rootKey, midKey, leafKey := key(), key(), key()
+	rootT := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(10 * 365 * 24 * time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	root := mk(rootT, rootT, &rootKey.PublicKey, rootKey)
+	midT := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "mid"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(intermediateLeft), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	mid := mk(midT, root, &midKey.PublicKey, rootKey)
+	leafT := &x509.Certificate{SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "leaf"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(365 * 24 * time.Hour), IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, KeyUsage: x509.KeyUsageDigitalSignature}
+	leaf := mk(leafT, mid, &leafKey.PublicKey, midKey)
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leaf.Raw, mid.Raw}, PrivateKey: leafKey}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_ = c.(*tls.Conn).Handshake()
+				c.Close()
+			}()
+		}
+	}()
+	roots = x509.NewCertPool()
+	roots.AddCert(root)
+	return ln.Addr().String(), roots
+}
+
+func TestTLSExpiryLooksAtTheWholeChain(t *testing.T) {
+	addr, roots := chainServer(t, 3*24*time.Hour+time.Hour)
+	r := NewRunner()
+	r.RootCAs = roots
+	c := config.Check{ID: "tls", Kind: config.KindTLS, Target: addr, Timeout: 2 * time.Second, MinValidity: 14 * 24 * time.Hour}
+	res := r.Run(context.Background(), c)
+	if res.OK || res.Error != "certificate expires in 3 days" {
+		t.Fatalf("the intermediate expiring should fail the check: ok=%v err=%q", res.OK, res.Error)
+	}
+	c.MinValidity = 24 * time.Hour
+	if res := r.Run(context.Background(), c); !res.OK {
+		t.Fatalf("chain valid beyond the minimum should pass: %s", res.Error)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -189,7 +190,17 @@ func (r *Runner) tls(ctx context.Context, c config.Check, now time.Time) error {
 	if len(state.PeerCertificates) == 0 {
 		return errors.New("no certificate")
 	}
-	left := state.PeerCertificates[0].NotAfter.Sub(now)
+	// The chain expires when its first certificate does: a leaf good for a
+	// year behind an intermediate that lapses next week fails next week.
+	expires := state.PeerCertificates[0].NotAfter
+	if len(state.VerifiedChains) > 0 {
+		for _, cert := range state.VerifiedChains[0] {
+			if cert.NotAfter.Before(expires) {
+				expires = cert.NotAfter
+			}
+		}
+	}
+	left := expires.Sub(now)
 	if left < c.MinValidity {
 		return fmt.Errorf("certificate expires in %s", humanDays(left))
 	}
@@ -225,6 +236,13 @@ func describe(ctx context.Context, err error) string {
 			return "connection refused"
 		}
 		return "cannot connect"
+	}
+	// url.Error prefixes the method and the full URL, query string included.
+	// The URL may be a redirect target chosen by the site being probed, so
+	// only the underlying error is kept.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
 	}
 	msg := err.Error()
 	if len(msg) > 200 {
