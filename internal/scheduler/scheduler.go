@@ -25,8 +25,9 @@ type Submitter interface {
 //   - Each interval gets up to ±10% jitter, so checks that happen to line up
 //     drift apart instead of staying aligned forever.
 //   - A check never overlaps itself. If the previous probe is still running
-//     when the next one is due (a slow target near its timeout), that tick
-//     is skipped and counted.
+//     when the next one is due (a slow target near its timeout), the tick is
+//     counted as skipped and runs as soon as that probe finishes, so a
+//     hanging target leaves no hole in its own history.
 type Scheduler struct {
 	Clock   clock.Clock
 	Pool    Submitter
@@ -54,7 +55,25 @@ func (s *Scheduler) Wait() { s.wg.Wait() }
 
 func (s *Scheduler) loop(ctx context.Context, c config.Check) {
 	defer s.wg.Done()
-	var running atomic.Bool
+	var (
+		mu      sync.Mutex
+		running bool
+		pending bool
+	)
+	job := func() {
+		for {
+			s.Run(ctx, c)
+			mu.Lock()
+			if pending && ctx.Err() == nil {
+				pending = false
+				mu.Unlock()
+				continue
+			}
+			running = false
+			mu.Unlock()
+			return
+		}
+	}
 	delay := time.Duration(s.Rand() * float64(c.Interval))
 	for {
 		select {
@@ -62,17 +81,20 @@ func (s *Scheduler) loop(ctx context.Context, c config.Check) {
 			return
 		case <-s.Clock.After(delay):
 		}
-		if running.CompareAndSwap(false, true) {
-			ok := s.Pool.Submit(ctx, func() {
-				defer running.Store(false)
-				s.Run(ctx, c)
-			})
-			if !ok {
-				running.Store(false)
+		mu.Lock()
+		if running {
+			pending = true
+			mu.Unlock()
+			s.Skipped.Add(1)
+		} else {
+			running = true
+			mu.Unlock()
+			if !s.Pool.Submit(ctx, job) {
+				mu.Lock()
+				running = false
+				mu.Unlock()
 				return
 			}
-		} else {
-			s.Skipped.Add(1)
 		}
 		delay = Jitter(c.Interval, s.Rand())
 	}

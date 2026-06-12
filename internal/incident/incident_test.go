@@ -1,6 +1,7 @@
 package incident
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -56,5 +57,42 @@ func TestResumedTrackerOnlyResolves(t *testing.T) {
 	}
 	if got := feed(tr, "++"); len(got) != 1 || got[0] != "resolve@0s" {
 		t.Fatalf("got %v", got)
+	}
+}
+
+func TestFlappingOpensAnIncident(t *testing.T) {
+	// Two failures in every three probes never makes three in a row.
+	noFlap := &Tracker{FailAfter: 3, RecoverAfter: 2}
+	if got := feed(noFlap, "--+--+--+--+"); got != nil {
+		t.Fatalf("without flap detection nothing opens: %v", got)
+	}
+	tr := &Tracker{FailAfter: 3, RecoverAfter: 2, FlapWindow: 10, FlapFailures: 6}
+	got := feed(tr, "--+--+--+--+++---")
+	// Six failures within the window by the 9th probe (index 7), dated from
+	// the first failure in the window; two good probes close it; the next
+	// three failures open a fresh one, not a flap left over from before.
+	want := []string{"open@0s", "resolve@11m0s", "open@14m0s"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestAGapBreaksTheStreak(t *testing.T) {
+	tr := &Tracker{FailAfter: 3, RecoverAfter: 2, MaxGap: time.Minute}
+	at := time.Unix(1000, 0)
+	obs := func(d time.Duration, ok bool) Transition {
+		tt, _, _ := tr.Observe(check.Result{At: at.Add(d), OK: ok, Error: "boom"})
+		return tt
+	}
+	obs(0, false)
+	obs(30*time.Second, false)
+	// Pulse was down for three days; this failure starts a new streak.
+	if obs(72*time.Hour, false) != None {
+		t.Fatal("failures before the gap must not count")
+	}
+	obs(72*time.Hour+30*time.Second, false)
+	tt, when, _ := tr.Observe(check.Result{At: at.Add(72*time.Hour + time.Minute), OK: false})
+	if tt != Opened || !when.Equal(at.Add(72*time.Hour)) {
+		t.Fatalf("incident should open dated after the gap: %v %s", tt, when)
 	}
 }

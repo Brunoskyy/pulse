@@ -153,3 +153,31 @@ func TestStopsWithoutLeaking(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+func TestASkippedTickRunsWhenTheSlowProbeFinishes(t *testing.T) {
+	fc := clock.NewFake(time.Unix(0, 0))
+	p := pool.New(2)
+	release := make(chan struct{})
+	var runs atomic.Int64
+	s := &Scheduler{Clock: fc, Pool: p, Rand: func() float64 { return 0 },
+		Run: func(context.Context, config.Check) {
+			if runs.Add(1) == 1 {
+				<-release // the first probe hangs past the next tick
+			}
+		}}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.Start(ctx, []config.Check{{ID: "slow", Interval: 10 * time.Second}})
+	waitFor(t, func() bool { return runs.Load() == 1 })
+	waitFor(t, func() bool { return fc.Waiters() == 1 })
+	fc.Advance(10 * time.Second) // due while the first probe still runs
+	waitFor(t, func() bool { return s.Skipped.Load() == 1 })
+	if runs.Load() != 1 {
+		t.Fatal("must not overlap")
+	}
+	close(release)
+	// No clock movement: the late tick runs as soon as the slow probe returns.
+	waitFor(t, func() bool { return runs.Load() == 2 })
+	cancel()
+	s.Wait()
+	p.Close()
+}

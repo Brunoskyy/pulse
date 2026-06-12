@@ -45,12 +45,24 @@ type Check struct {
 	// Consecutive failures before an incident opens, and successes before it closes.
 	FailAfter    int `yaml:"fail_after"`
 	RecoverAfter int `yaml:"recover_after"`
+	// Flap opens an incident when Failures of the last Window probes failed,
+	// even if they never ran FailAfter in a row. A service failing two probes
+	// in three is down for its users. Failures 0 turns it off.
+	Flap Flap `yaml:"flap"`
+}
+
+type Flap struct {
+	Window   int `yaml:"window"`
+	Failures int `yaml:"failures"`
 }
 
 type Notifier struct {
 	Kind   string `yaml:"kind"` // "webhook" or "slack"
 	URL    string `yaml:"url"`
 	Secret string `yaml:"secret"` // webhook only; may be "${ENV_VAR}"
+	// URL may also be "${ENV_VAR}". Only these two fields are expanded, only
+	// the ${NAME} form, and a reference to an unset variable is an error: a
+	// missing secret would otherwise send every webhook unsigned.
 }
 
 type Config struct {
@@ -78,7 +90,7 @@ func Load(path string) (*Config, error) {
 // typo in check 12 does not hide a typo in check 30.
 func Parse(raw []byte) (*Config, error) {
 	var c Config
-	dec := yaml.NewDecoder(strings.NewReader(os.ExpandEnv(string(raw))))
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("pulse.yaml: %w", err)
@@ -132,14 +144,23 @@ func Parse(raw []byte) (*Config, error) {
 		if ch.MaxGap < ch.Interval {
 			errs = append(errs, fmt.Errorf("%s: max_gap cannot be shorter than the interval", where))
 		}
-		if ch.Timeout > ch.Interval {
-			ch.Timeout = ch.Interval
+		// The next tick can come as early as 0.9 of the interval (jitter), so
+		// a probe that uses the full interval would make every other tick be
+		// skipped. 0.8 leaves room.
+		if limit := ch.Interval * 8 / 10; ch.Timeout > limit {
+			ch.Timeout = limit
 		}
 		if ch.FailAfter <= 0 {
 			ch.FailAfter = 3
 		}
 		if ch.RecoverAfter <= 0 {
 			ch.RecoverAfter = 2
+		}
+		if ch.Flap.Window == 0 && ch.Flap.Failures == 0 {
+			ch.Flap = Flap{Window: 10, Failures: 6}
+		}
+		if ch.Flap.Failures < 0 || ch.Flap.Window < 0 || ch.Flap.Failures > ch.Flap.Window {
+			errs = append(errs, fmt.Errorf("%s: flap.failures must be between 0 and flap.window", where))
 		}
 		switch ch.Kind {
 		case KindHTTP:
@@ -165,7 +186,15 @@ func Parse(raw []byte) (*Config, error) {
 			errs = append(errs, fmt.Errorf("%s: kind must be http, tcp, dns or tls", where))
 		}
 	}
-	for i, n := range c.Notifiers {
+	for i := range c.Notifiers {
+		n := &c.Notifiers[i]
+		var err error
+		if n.URL, err = expand(n.URL); err != nil {
+			errs = append(errs, fmt.Errorf("notifiers[%d].url: %w", i, err))
+		}
+		if n.Secret, err = expand(n.Secret); err != nil {
+			errs = append(errs, fmt.Errorf("notifiers[%d].secret: %w", i, err))
+		}
 		if n.Kind != "webhook" && n.Kind != "slack" {
 			errs = append(errs, fmt.Errorf("notifiers[%d]: kind must be webhook or slack", i))
 		}
@@ -180,6 +209,26 @@ func Parse(raw []byte) (*Config, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expand replaces ${NAME} with the environment variable, and fails when one
+// is unset or empty. A bare $ is left as written.
+func expand(s string) (string, error) {
+	var missing []string
+	out := envRef.ReplaceAllStringFunc(s, func(ref string) string {
+		name := envRef.FindStringSubmatch(ref)[1]
+		v, ok := os.LookupEnv(name)
+		if !ok || v == "" {
+			missing = append(missing, name)
+		}
+		return v
+	})
+	if len(missing) > 0 {
+		return "", fmt.Errorf("environment variable %s is not set", strings.Join(missing, ", "))
+	}
+	return out, nil
 }
 
 func slug(s string) string {

@@ -34,8 +34,11 @@ checks:
 	if api.FailAfter != 3 || api.RecoverAfter != 2 {
 		t.Fatalf("thresholds: %+v", api)
 	}
-	if c.Checks[1].Timeout != 5*time.Second {
-		t.Fatalf("timeout should be capped at the interval, got %s", c.Checks[1].Timeout)
+	if c.Checks[1].Timeout != 4*time.Second {
+		t.Fatalf("timeout should be capped at 0.8 of the interval, got %s", c.Checks[1].Timeout)
+	}
+	if api.Flap != (Flap{Window: 10, Failures: 6}) {
+		t.Fatalf("flap default: %+v", api.Flap)
 	}
 	if c.Checks[2].MinValidity != 14*24*time.Hour {
 		t.Fatalf("tls min validity default: %s", c.Checks[2].MinValidity)
@@ -90,5 +93,36 @@ func TestSlug(t *testing.T) {
 		if got := slug(in); got != want {
 			t.Errorf("slug(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestEnvExpansionIsNarrowAndStrict(t *testing.T) {
+	base := "checks:\n  - id: a\n    kind: http\n    target: https://example.com\n    expect_contains: \"$5.00 ${NOT_A_FIELD_WE_EXPAND}\"\nnotifiers:\n  - kind: webhook\n    url: ${PULSE_TEST_URL}\n    secret: ${PULSE_TEST_SECRET}\n"
+	t.Setenv("PULSE_TEST_URL", "https://hooks.example.com/x")
+	t.Setenv("PULSE_TEST_SECRET", "")
+	if _, err := Parse([]byte(base)); err == nil || !strings.Contains(err.Error(), "PULSE_TEST_SECRET is not set") {
+		t.Fatalf("an empty secret variable must be an error: %v", err)
+	}
+	t.Setenv("PULSE_TEST_SECRET", "s3cr3t")
+	c, err := Parse([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Checks[0].ExpectContains; got != "$5.00 ${NOT_A_FIELD_WE_EXPAND}" {
+		t.Fatalf("only url and secret are expanded, and a bare $ is kept: %q", got)
+	}
+	if c.Notifiers[0].URL != "https://hooks.example.com/x" || c.Notifiers[0].Secret != "s3cr3t" {
+		t.Fatalf("notifier not expanded: %+v", c.Notifiers[0])
+	}
+}
+
+func TestFlapMustFitItsWindow(t *testing.T) {
+	_, err := Parse([]byte("checks:\n  - id: a\n    kind: dns\n    target: example.com\n    flap: {window: 3, failures: 5}\n"))
+	if err == nil || !strings.Contains(err.Error(), "flap.failures") {
+		t.Fatalf("expected a flap error, got %v", err)
+	}
+	c, err := Parse([]byte("checks:\n  - id: a\n    kind: dns\n    target: example.com\n    flap: {window: 5, failures: 0}\n"))
+	if err != nil || c.Checks[0].Flap.Failures != 0 {
+		t.Fatalf("failures 0 turns flap detection off: %v %+v", err, c)
 	}
 }

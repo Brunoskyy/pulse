@@ -205,3 +205,35 @@ func TestShutdownDoesNotRecordCancelledProbes(t *testing.T) {
 		t.Fatal("a probe cancelled by shutdown was recorded as a failure")
 	}
 }
+
+func TestRestartAfterALongOutageDoesNotBackdate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two failures, then Pulse was down for three days.
+	_ = st.AddResult(context.Background(), probe(-3*86400, false))
+	_ = st.AddResult(context.Background(), probe(-3*86400+30, false))
+	st.Close()
+	st2, _ := store.Open(path)
+	t.Cleanup(func() { st2.Close() })
+	rec := &recorder{}
+	cfg := &config.Config{Retention: 90 * 24 * time.Hour, Workers: 2, Checks: []config.Check{
+		{ID: "api", Name: "Public API", Kind: config.KindHTTP, FailAfter: 3, RecoverAfter: 2, MaxGap: time.Minute},
+	}}
+	m := &Monitor{Config: cfg, Store: st2, Notifier: rec, Clock: clock.NewFake(time.Unix(1_800_000_000, 0)), Log: slog.New(slog.DiscardHandler)}
+	if err := m.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c := cfg.Checks[0]
+	m.Record(context.Background(), c, probe(0, false))
+	if len(rec.events) != 0 {
+		t.Fatalf("one failure after the restart must not open an incident: %+v", rec.events)
+	}
+	m.Record(context.Background(), c, probe(30, false))
+	m.Record(context.Background(), c, probe(60, false))
+	if len(rec.events) != 1 || !rec.events[0].StartedAt.Equal(time.Unix(1_800_000_000, 0)) {
+		t.Fatalf("the incident should start after the outage, not three days before: %+v", rec.events)
+	}
+}

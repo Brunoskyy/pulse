@@ -79,7 +79,13 @@ func (m *Monitor) Load(ctx context.Context) error {
 		return err
 	}
 	for _, c := range m.Config.Checks {
-		t := &incident.Tracker{FailAfter: c.FailAfter, RecoverAfter: c.RecoverAfter}
+		t := &incident.Tracker{
+			FailAfter:    c.FailAfter,
+			RecoverAfter: c.RecoverAfter,
+			FlapWindow:   c.Flap.Window,
+			FlapFailures: c.Flap.Failures,
+			MaxGap:       c.MaxGap,
+		}
 		if in, ok := open[c.ID]; ok {
 			t.Resume()
 			m.open[c.ID] = openIncident{id: in.ID, started: in.StartedAt}
@@ -106,10 +112,22 @@ func (m *Monitor) Load(ctx context.Context) error {
 // results that crossed a threshold without the incident row being written
 // (or closed) before the process died.
 func (m *Monitor) replay(ctx context.Context, c config.Check, t *incident.Tracker) error {
-	n := max(c.FailAfter, c.RecoverAfter)
-	recent, err := m.Store.Recent(ctx, c.ID, n)
+	n := max(c.FailAfter, c.RecoverAfter, c.Flap.Window)
+	all, err := m.Store.Recent(ctx, c.ID, n)
 	if err != nil {
 		return err
+	}
+	// Results older than max_gap are from before Pulse stopped watching; a
+	// failure streak from three days ago must not date a new incident.
+	recent := all
+	if c.MaxGap > 0 {
+		cutoff := m.Clock.Now().Add(-c.MaxGap)
+		recent = nil
+		for _, r := range all {
+			if !r.At.Before(cutoff) {
+				recent = append(recent, r)
+			}
+		}
 	}
 	for _, r := range recent {
 		switch tr, at, reason := t.Observe(r); tr {
@@ -130,8 +148,8 @@ func (m *Monitor) replay(ctx context.Context, c config.Check, t *incident.Tracke
 			}
 		}
 	}
-	if len(recent) > 0 {
-		m.live[c.ID] = Live{Last: recent[len(recent)-1], HasData: true, Down: t.Open()}
+	if len(all) > 0 {
+		m.live[c.ID] = Live{Last: all[len(all)-1], HasData: true, Down: t.Open()}
 	}
 	return nil
 }

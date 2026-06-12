@@ -25,9 +25,23 @@ const (
 // and ends at the first of those. A single blip below the threshold never
 // becomes an incident, and a single good probe in the middle of an outage does
 // not end it.
+//
+// Two more rules. With FlapWindow and FlapFailures set, an incident also
+// opens when FlapFailures of the last FlapWindow probes failed, so a service
+// that fails two probes in three is not reported as healthy just because it
+// never failed three in a row. And a gap longer than MaxGap between two
+// results breaks every streak: Pulse was not watching in between, so
+// failures before the gap say nothing about what came after.
 type Tracker struct {
 	FailAfter    int
 	RecoverAfter int
+	FlapWindow   int
+	FlapFailures int
+	MaxGap       time.Duration
+
+	window  []windowEntry
+	lastAt  time.Time
+	hasLast bool
 
 	failStreak int
 	okStreak   int
@@ -46,7 +60,22 @@ func (t *Tracker) Open() bool { return t.open }
 
 // Observe feeds one result and reports whether it opened or resolved an
 // incident, with the time the transition should be dated at.
+type windowEntry struct {
+	at time.Time
+	ok bool
+}
+
 func (t *Tracker) Observe(r check.Result) (Transition, time.Time, string) {
+	if t.hasLast && t.MaxGap > 0 && r.At.Sub(t.lastAt) > t.MaxGap {
+		t.failStreak, t.okStreak, t.window = 0, 0, nil
+	}
+	t.lastAt, t.hasLast = r.At, true
+	if t.FlapWindow > 0 {
+		t.window = append(t.window, windowEntry{at: r.At, ok: r.OK})
+		if len(t.window) > t.FlapWindow {
+			t.window = t.window[len(t.window)-t.FlapWindow:]
+		}
+	}
 	if r.OK {
 		t.failStreak = 0
 		if t.okStreak == 0 {
@@ -55,6 +84,9 @@ func (t *Tracker) Observe(r check.Result) (Transition, time.Time, string) {
 		t.okStreak++
 		if t.open && t.okStreak >= t.RecoverAfter {
 			t.open = false
+			// Start the flap window fresh, or the failures that caused this
+			// incident would reopen it on the next single failure.
+			t.window = nil
 			return Resolved, t.firstOK, ""
 		}
 		return None, time.Time{}, ""
@@ -68,6 +100,22 @@ func (t *Tracker) Observe(r check.Result) (Transition, time.Time, string) {
 	if !t.open && t.failStreak >= t.FailAfter {
 		t.open = true
 		return Opened, t.firstFail, r.Error
+	}
+	if !t.open && t.FlapFailures > 0 && len(t.window) >= t.FlapFailures {
+		failed := 0
+		var first time.Time
+		for _, w := range t.window {
+			if !w.ok {
+				if failed == 0 {
+					first = w.at
+				}
+				failed++
+			}
+		}
+		if failed >= t.FlapFailures {
+			t.open = true
+			return Opened, first, r.Error
+		}
 	}
 	return None, time.Time{}, ""
 }
