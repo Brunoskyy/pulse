@@ -33,6 +33,13 @@ variable "config_path" {
   default     = "../examples/pulse.yaml"
 }
 
+variable "secret_env" {
+  description = "Environment variables the config references as $${NAME}, stored as SecureString parameters, e.g. { PULSE_WEBHOOK_SECRET = \"...\", SLACK_WEBHOOK_URL = \"...\" }."
+  type        = map(string)
+  default     = {}
+  sensitive   = true
+}
+
 variable "public_url" {
   description = "Public URL of the status page, used in notification links."
   type        = string

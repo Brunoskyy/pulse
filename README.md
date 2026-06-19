@@ -82,6 +82,9 @@ checks:
     expect_contains: '"status":"ok"'
     fail_after: 3       # consecutive failures before an incident opens
     recover_after: 2    # consecutive successes before it resolves
+    flap:               # also open when 6 of the last 10 probes failed
+      window: 10
+      failures: 6       # 0 turns it off
 
   - name: Certificate
     kind: tls
@@ -97,9 +100,14 @@ notifiers:
     url: ${SLACK_WEBHOOK_URL}
 ```
 
-`${VARS}` are expanded from the environment. When `PULSE_CONFIG` is set, its
-contents are used instead of the file, which is how the container gets its
-config from a secret store. A fuller example is in `examples/pulse.yaml`.
+Notifier `url` and `secret` may be `${NAME}`, read from the environment, and a
+reference to a variable that is unset or empty stops Pulse at startup: a
+missing secret would otherwise send every webhook unsigned. Nothing else is
+expanded, so `expect_contains: "$5.00"` means what it says. The timeout is
+capped at 0.8 of the interval, because the next tick can come as early as 0.9
+of it. When `PULSE_CONFIG` is set, its contents are used instead of the file,
+which is how the container gets its config from a secret store. A fuller
+example is in `examples/pulse.yaml`.
 
 ## How checks and incidents work
 
@@ -109,21 +117,29 @@ millisecond after a restart, and every interval after that gets up to ten
 percent of jitter so checks that happen to line up drift apart. Probes run on a
 bounded worker pool; when it is full the scheduler waits, which is the
 back-pressure a slow network should cause. A check never overlaps itself: if a
-probe is still running when the next one is due, that tick is skipped and
-counted in `pulse_skipped_ticks_total`.
+probe is still running when the next one is due, the tick is counted in
+`pulse_skipped_ticks_total` and runs the moment that probe returns, so a
+hanging target does not leave holes in its own downtime.
 
 **Probes.** Every probe runs under its own timeout and reports a short reason:
 `timeout`, `connection refused`, `status 503`, `certificate expires in 9 days`.
 HTTP probes follow up to five redirects, open a fresh connection each time,
-and search at most the first megabyte for `expect_contains`.
+and search at most the first megabyte for `expect_contains`. A reason never
+includes a URL: a redirect target is chosen by the site being probed, and it
+would otherwise travel into Slack. The TLS check fails on the first
+certificate in the chain to expire, not just the leaf.
 
 **Incidents.** An incident opens after `fail_after` consecutive failures and is
 dated from the first of them, because that is when the outage started. It
 resolves after `recover_after` consecutive successes, dated from the first
 success. One blip below the threshold never becomes an incident, and one good
-probe in the middle of an outage does not end it.
+probe in the middle of an outage does not end it. A service that flaps, failing
+two probes in three but never three in a row, opens one too, through the
+`flap` window. A gap longer than `max_gap` between two results breaks every
+streak: failures from before Pulse stopped watching say nothing about after.
 
-**Restarts.** On startup Pulse replays the last few results of every check. A
+**Restarts.** On startup Pulse replays the last few results of every check,
+as long as they are newer than `max_gap`. A
 restart in the middle of an outage keeps the incident it already had, a
 failure streak that had not crossed the threshold yet is remembered, and an
 incident a crash left half-written (results stored, incident row not) is
@@ -164,7 +180,14 @@ def verify(secret: bytes, header: str, body: bytes, tolerance=300) -> bool:
 ```
 
 `kind: slack` posts a one-line message to anything that accepts Slack's
-`{"text": ...}` shape.
+`{"text": ...}` shape, with `&`, `<` and `>` escaped the way Slack asks, so a
+check name or reason cannot ping `@channel` or dress up a link.
+
+Every notifier has its own queue and goroutine, so a Slack URL that hangs does
+not hold back the webhook. Network errors, 5xx, 408 and 429 are retried with
+backoff; any other 4xx (a revoked URL, a receiver that rejects the payload) is
+logged once and not retried. On shutdown the queues drain until the shutdown
+deadline, and anything still waiting after it is logged and dropped.
 
 ## Deploying to AWS
 
@@ -181,13 +204,18 @@ terraform apply \
   -var 'private_subnet_ids=["subnet-c","subnet-d"]' \
   -var certificate_arn=arn:aws:acm:... \
   -var image=<account>.dkr.ecr.<region>.amazonaws.com/pulse:1.0.0 \
-  -var public_url=https://status.example.com
+  -var public_url=https://status.example.com \
+  -var 'secret_env={PULSE_WEBHOOK_SECRET="...", SLACK_WEBHOOK_URL="https://hooks.slack.com/..."}'
 ```
+
+`secret_env` holds whatever the config references as `${NAME}`. Each entry
+becomes a SecureString parameter and an environment variable in the task.
 
 It runs exactly one task, on purpose. SQLite wants a single writer, and a
 monitor that runs twice sends every alert twice, so deployments stop the old
-task before starting the new one; the page is unavailable for the seconds that
-takes. The image is `distroless/static` running as non-root, built by the
+task before starting the new one. The page is unavailable while that happens,
+which is a few seconds because the target group skips the default five-minute
+drain. The image is `distroless/static` running as non-root, built by the
 `Dockerfile`; `.goreleaser.yaml` builds release binaries.
 
 ## Things worth opening
@@ -218,13 +246,17 @@ go test -race ./...
 go test -run xxx -bench . ./internal/pool
 ```
 
-50 tests (58 with subtests), all with the race detector on. The probes run
+61 tests (69 with subtests), all with the race detector on. The probes run
 against `httptest` servers and real sockets, including a TLS server whose
-certificate is checked for trust and expiry. The scheduler and the monitor run
+certificate is checked for trust and expiry, and a chain whose intermediate
+expires before the leaf. A site that redirects forever to a URL full of Slack
+markup checks that the reason never carries it. The scheduler and the monitor run
 on a fake clock. The store is tested against real SQLite files: the uptime
 weighting, gaps, the p95 rank, batched pruning, and eight writers with four
-readers at once. The monitor tests restart on the same database mid-outage and
-after a simulated crash. Webhook signatures are checked against a vector
+readers at once. The monitor tests restart on the same database mid-outage,
+after a simulated crash, and after three days of Pulse being down. The
+incident tests cover flapping and gaps; the notifier tests cover escaping,
+which statuses are retried, and one hung receiver next to a healthy one. Webhook signatures are checked against a vector
 computed outside Go. The page test feeds a check named `<script>` through the
 template.
 

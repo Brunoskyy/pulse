@@ -67,6 +67,22 @@ resource "aws_ssm_parameter" "config" {
   value = file(var.config_path)
 }
 
+# Values the config refers to as ${NAME}. Each becomes an environment
+# variable in the task; Pulse refuses to start when the config references
+# one that is missing, so an unsigned webhook cannot slip through.
+locals {
+  # The names are not secret, only the values; unwrapping the key set lets
+  # them drive for_each without exposing a value.
+  env_names = nonsensitive(toset([for k, v in var.secret_env : k if v != ""]))
+}
+
+resource "aws_ssm_parameter" "env" {
+  for_each = local.env_names
+  name     = "/pulse/env/${each.key}"
+  type     = "SecureString"
+  value    = var.secret_env[each.key]
+}
+
 # --- Network ---------------------------------------------------------------
 
 resource "aws_security_group" "alb" {
@@ -128,6 +144,9 @@ resource "aws_lb_target_group" "this" {
   protocol    = "HTTP"
   target_type = "ip"
   vpc_id      = data.aws_vpc.this.id
+  # Only one task ever runs, so there are no other requests to drain for.
+  # The default 300s left the page returning 503 for five minutes per deploy.
+  deregistration_delay = 5
   health_check {
     path    = "/healthz"
     matcher = "200"
@@ -171,7 +190,7 @@ resource "aws_iam_role_policy_attachment" "execution" {
 data "aws_iam_policy_document" "read_config" {
   statement {
     actions   = ["ssm:GetParameters"]
-    resources = [aws_ssm_parameter.config.arn]
+    resources = concat([aws_ssm_parameter.config.arn], [for p in aws_ssm_parameter.env : p.arn])
   }
 }
 
@@ -213,9 +232,12 @@ resource "aws_ecs_task_definition" "pulse" {
     command      = ["run"]
     portMappings = [{ containerPort = 8080, protocol = "tcp" }]
     environment  = [{ name = "PULSE_PUBLIC_URL", value = var.public_url }]
-    secrets      = [{ name = "PULSE_CONFIG", valueFrom = aws_ssm_parameter.config.arn }]
-    mountPoints  = [{ sourceVolume = "data", containerPath = "/data" }]
-    stopTimeout  = 20
+    secrets = concat(
+      [{ name = "PULSE_CONFIG", valueFrom = aws_ssm_parameter.config.arn }],
+      [for k, p in aws_ssm_parameter.env : { name = k, valueFrom = p.arn }],
+    )
+    mountPoints = [{ sourceVolume = "data", containerPath = "/data" }]
+    stopTimeout = 20
     logConfiguration = {
       logDriver = "awslogs"
       options = {
