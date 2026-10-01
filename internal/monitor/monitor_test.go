@@ -237,3 +237,33 @@ func TestRestartAfterALongOutageDoesNotBackdate(t *testing.T) {
 		t.Fatalf("the incident should start after the outage, not three days before: %+v", rec.events)
 	}
 }
+
+func TestRestartIgnoresAStreakFromBeforeTheGap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three failures, close together, three days ago: enough to open an
+	// incident, and no gap between them for the tracker to notice. Only the
+	// replay cutoff keeps them from opening one dated three days back.
+	for _, at := range []int{-3 * 86400, -3*86400 + 30, -3*86400 + 60} {
+		_ = st.AddResult(context.Background(), probe(at, false))
+	}
+	st.Close()
+	st2, _ := store.Open(path)
+	t.Cleanup(func() { st2.Close() })
+	cfg := &config.Config{Retention: 90 * 24 * time.Hour, Workers: 2, Checks: []config.Check{
+		{ID: "api", Name: "Public API", Kind: config.KindHTTP, FailAfter: 3, RecoverAfter: 2, MaxGap: time.Minute},
+	}}
+	m := &Monitor{Config: cfg, Store: st2, Notifier: &recorder{}, Clock: clock.NewFake(time.Unix(1_800_000_000, 0)), Log: slog.New(slog.DiscardHandler)}
+	if err := m.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if open, _ := st2.OpenIncidents(context.Background()); len(open) != 0 {
+		t.Fatalf("a streak from before the gap opened an incident on restart: %+v", open)
+	}
+	if live, _ := m.Snapshot(); live["api"].Down {
+		t.Fatal("check should not show as down")
+	}
+}
