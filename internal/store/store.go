@@ -392,6 +392,12 @@ func (s *Store) Recent(ctx context.Context, checkID string, n int) ([]check.Resu
 const PruneBatch = 5000
 
 // Prune deletes results and closed incidents older than cutoff.
+//
+// Each batch takes the write lock like every other write. Without it nothing
+// fails today: busy_timeout makes SQLite queue the writers itself. But a
+// writer that waits longer than the timeout gets SQLITE_BUSY and the probe
+// result is lost, and the queue SQLite keeps is not fair. The mutex makes a
+// fresh result wait for at most one batch, never for an error.
 func (s *Store) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 	var total int64
 	for {

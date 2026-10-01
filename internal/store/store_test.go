@@ -232,6 +232,29 @@ func TestPruneInBatches(t *testing.T) {
 	}
 }
 
+// Nothing observable breaks if Prune skips the write lock, because SQLite's
+// busy_timeout queues the writers anyway, so this checks the lock itself.
+func TestPruneWaitsForTheWriteLock(t *testing.T) {
+	s := open(t)
+	add(t, s, t0, true, 1)
+	s.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := s.Prune(context.Background(), t0.Add(24*time.Hour)); err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case <-done:
+		s.mu.Unlock()
+		t.Fatal("Prune wrote while another write held the lock")
+	case <-time.After(200 * time.Millisecond):
+	}
+	s.mu.Unlock()
+	<-done
+}
+
 func TestRecentIsOldestFirst(t *testing.T) {
 	s := open(t)
 	for i := range 5 {
