@@ -11,15 +11,14 @@
 
 <br>
 
-Point it at a YAML file with the things you care about. It probes them on an
-interval, opens an incident when something stays down, tells a webhook or a
-Slack channel, and serves a status page with ninety days of history. No
-database server, no cgo, no JavaScript framework: one static binary and one
-SQLite file.
+Checking a pulse is the quickest way to know something is alive, and that is
+all Pulse does, on a schedule. Point it at a YAML file; it probes each target
+on an interval, opens an incident when something stays down, tells a webhook
+or a Slack channel, and serves a status page with ninety days of history. One
+static binary and one SQLite file, no cgo, no JavaScript framework.
 
-I built it to have a Go project where the interesting parts are the ones that
-are easy to get subtly wrong: scheduling many probes without them bunching up
-or piling up, deciding when a failure is an outage, and computing an uptime
+The interesting parts are the ones easy to get subtly wrong: scheduling many
+probes without bunching, deciding when a failure is an outage, and an uptime
 figure that means what it says.
 
 ![The status page during an incident](docs/screenshots/incident-light.jpg)
@@ -31,27 +30,41 @@ figure that means what it says.
 
 ## Running it
 
-Go 1.26 or newer.
+You need Go 1.26 or newer. Nothing else: no database server, no Docker.
+
+1. Clone and start the demo, from the repo root:
+
+   ```bash
+   git clone https://github.com/Brunoskyy/pulse.git && cd pulse
+   go run ./cmd/pulse demo
+   ```
+
+2. Open http://127.0.0.1:8080. The demo runs four fake services on loopback,
+   fills ninety days of history with a few scripted outages, and checks them
+   every five seconds.
+
+3. In a second terminal, take a service down with the `curl -X POST .../down/search`
+   command the demo printed. About ten seconds later an incident opens; run
+   the same command with `/up/` instead of `/down/` and it closes ten seconds after.
+
+Stop with Ctrl+C. The demo keeps its database in a temporary folder that is
+deleted on exit, so every run starts fresh.
+
+For real checks, from the repo root:
 
 ```bash
-go run ./cmd/pulse demo        # http://127.0.0.1:8080
-```
-
-The demo starts four fake services on loopback, fills ninety days of history
-with a few scripted outages, and monitors them every five seconds. It prints a
-`curl` command that takes one of them down; about ten seconds later an incident
-opens, and it closes ten seconds after you bring the service back with the
-same command and `/up/` instead of `/down/`.
-
-For real checks:
-
-```bash
+cp examples/pulse.yaml pulse.yaml   # edit the checks; set database: pulse.db to keep it local
 go build -o pulse ./cmd/pulse
-./pulse check -config pulse.yaml   # validate and exit
-./pulse run   -config pulse.yaml
+./pulse check -config pulse.yaml    # validate and exit
+./pulse run -config pulse.yaml      # status page on :8080
 ```
 
-| | |
+The example writes to `/data/pulse.db`, the container's path, so change it
+first. Its notifiers read `PULSE_WEBHOOK_SECRET` and `SLACK_WEBHOOK_URL`, and
+Pulse refuses to start until those are set, so export them or delete the
+`notifiers` block. Delete the database file to reset the history.
+
+| Path | |
 | --- | --- |
 | `/` | the status page |
 | `/api/status` | the same data as JSON |
@@ -59,11 +72,15 @@ go build -o pulse ./cmd/pulse
 | `/metrics` | Prometheus text format |
 | `/healthz` | liveness |
 
+| Command (repo root) | |
+| --- | --- |
+| `go test -race ./...` | 61 tests (69 with subtests) |
+| `go test -run xxx -bench . ./internal/pool` | the worker pool benchmark |
+
 ## Configuration
 
-Everything except `checks` has a default. Unknown keys are an error, so a typo
-never silently falls back to a default, and every problem in the file is
-reported at once.
+Everything except `checks` has a default, and unknown keys are an error, with
+every problem in the file reported at once.
 
 ```yaml
 title: Northwind status
@@ -100,74 +117,47 @@ notifiers:
     url: ${SLACK_WEBHOOK_URL}
 ```
 
-Notifier `url` and `secret` may be `${NAME}`, read from the environment, and a
-reference to a variable that is unset or empty stops Pulse at startup: a
-missing secret would otherwise send every webhook unsigned. Nothing else is
-expanded, so `expect_contains: "$5.00"` means what it says. The timeout is
-capped at 0.8 of the interval, because the next tick can come as early as 0.9
-of it. When `PULSE_CONFIG` is set, its contents are used instead of the file,
-which is how the container gets its config from a secret store. A fuller
-example is in `examples/pulse.yaml`.
+
+Notifier `url` and `secret` may be `${NAME}` from the environment, and an
+unset one stops Pulse at startup, since a missing secret would send every
+webhook unsigned. Nothing else is expanded, so `"$5.00"` means what it says.
+When `PULSE_CONFIG` is set, its contents replace the file, which is how the
+container gets its config from a secret store.
 
 ## How checks and incidents work
 
-**Scheduling.** Each check waits a random fraction of its interval before its
-first run, so forty checks on a 30-second interval do not all fire in the same
-millisecond after a restart, and every interval after that gets up to ten
-percent of jitter so checks that happen to line up drift apart. Probes run on a
-bounded worker pool; when it is full the scheduler waits, which is the
-back-pressure a slow network should cause. A check never overlaps itself: if a
-probe is still running when the next one is due, the tick is counted in
-`pulse_skipped_ticks_total` and runs the moment that probe returns, so a
-hanging target does not leave holes in its own downtime.
-
-**Probes.** Every probe runs under its own timeout and reports a short reason:
-`timeout`, `connection refused`, `status 503`, `certificate expires in 9 days`.
-HTTP probes follow up to five redirects, open a fresh connection each time,
-and search at most the first megabyte for `expect_contains`. A reason never
-includes a URL: a redirect target is chosen by the site being probed, and it
-would otherwise travel into Slack. The TLS check fails on the first
-certificate in the chain to expire, not just the leaf.
-
-**Incidents.** An incident opens after `fail_after` consecutive failures and is
-dated from the first of them, because that is when the outage started. It
-resolves after `recover_after` consecutive successes, dated from the first
-success. One blip below the threshold never becomes an incident, and one good
-probe in the middle of an outage does not end it. A service that flaps, failing
-two probes in three but never three in a row, opens one too, through the
-`flap` window. A gap longer than `max_gap` between two results breaks every
-streak: failures from before Pulse stopped watching say nothing about after.
-
-**Restarts.** On startup Pulse replays the last few results of every check,
-as long as they are newer than `max_gap`. A
-restart in the middle of an outage keeps the incident it already had, a
-failure streak that had not crossed the threshold yet is remembered, and an
-incident a crash left half-written (results stored, incident row not) is
-repaired. A probe cut short by the shutdown itself is not recorded, so a deploy
-does not paint a red mark on every service.
-
-**Uptime.** Each probe stands for the time until the next one, so a minute of
-failures probed every five seconds weighs one minute, not twelve times as much
-as an hour probed every ten minutes. One probe never stands for more than
-`max_gap` (twice the interval by default): past that, Pulse was not looking,
-and time nobody looked at is no data, neither uptime nor downtime. The
-percentage is truncated, never rounded, so 99.996% reads 99.99% and a page with
-an incident on it never claims 100%.
-
-**Latency.** p95 is nearest-rank over successful probes only. A timeout already
-counts as downtime; letting it into the latency figure would count it twice.
+- **Scheduling:** each check starts at a random fraction of its interval and
+  gets up to ten percent of jitter after that, so checks never fire together.
+  Probes run on a bounded pool, and a check never overlaps itself: a tick due
+  while its probe still runs waits for it and is counted in
+  `pulse_skipped_ticks_total`.
+- **Probes:** every probe has its own timeout and a short reason (`timeout`,
+  `status 503`, `certificate expires in 9 days`). A reason never includes a
+  URL, because a redirect target is chosen by the site and would travel into
+  Slack. The TLS check fails on the first certificate in the chain to expire.
+- **Incidents:** one opens after `fail_after` consecutive failures, dated from
+  the first, and resolves after `recover_after` successes. A service failing
+  two probes in three opens one through the `flap` window. A gap longer than
+  `max_gap` breaks every streak.
+- **Restarts:** Pulse replays recent results, so a restart mid-outage keeps its
+  incident, and a probe cut short by shutdown is not recorded.
+- **Uptime:** each probe stands for the time until the next one, capped at
+  `max_gap`, so time nobody looked at is no data. The percentage is truncated,
+  never rounded, so a page with an incident never claims 100%.
+- **Latency:** p95 is nearest-rank over successful probes only; a timeout
+  already counts as downtime.
 
 ## Notifications
 
-Webhooks are JSON, delivered in the background with retries, from a bounded
-queue so a dead receiver can never delay a probe. When a secret is set, each
-request carries a signature in the same shape Stripe uses:
+Webhooks are JSON, sent in the background with retries from a bounded queue
+per notifier, so a dead receiver never delays a probe or another notifier.
+When a secret is set, each request is signed in the same shape Stripe uses:
 
 ```
 Pulse-Signature: t=1790000000,v1=5f3c...e1
 ```
 
-where `v1` is the hex HMAC-SHA256 of `"<t>.<body>"`. Verifying it in Python:
+`v1` is the hex HMAC-SHA256 of `"<t>.<body>"`. Verifying it in Python:
 
 ```python
 import hashlib, hmac, time
@@ -179,15 +169,9 @@ def verify(secret: bytes, header: str, body: bytes, tolerance=300) -> bool:
     return fresh and hmac.compare_digest(expected, parts["v1"])
 ```
 
-`kind: slack` posts a one-line message to anything that accepts Slack's
-`{"text": ...}` shape, with `&`, `<` and `>` escaped the way Slack asks, so a
-check name or reason cannot ping `@channel` or dress up a link.
-
-Every notifier has its own queue and goroutine, so a Slack URL that hangs does
-not hold back the webhook. Network errors, 5xx, 408 and 429 are retried with
-backoff; any other 4xx (a revoked URL, a receiver that rejects the payload) is
-logged once and not retried. On shutdown the queues drain until the shutdown
-deadline, and anything still waiting after it is logged and dropped.
+`kind: slack` escapes `&`, `<` and `>` the way Slack asks, so a check name
+cannot ping `@channel`. Network errors, 5xx, 408 and 429 are retried; any
+other 4xx is logged once and dropped.
 
 ## Deploying to AWS
 
@@ -208,84 +192,43 @@ terraform apply \
   -var 'secret_env={PULSE_WEBHOOK_SECRET="...", SLACK_WEBHOOK_URL="https://hooks.slack.com/..."}'
 ```
 
-`secret_env` holds whatever the config references as `${NAME}`. Each entry
-becomes a SecureString parameter and an environment variable in the task.
-
-It runs exactly one task, on purpose. SQLite wants a single writer, and a
-monitor that runs twice sends every alert twice, so deployments stop the old
-task before starting the new one. The page is unavailable while that happens,
-which is a few seconds because the target group skips the default five-minute
-drain. The image is `distroless/static` running as non-root, built by the
-`Dockerfile`; `.goreleaser.yaml` builds release binaries.
+`secret_env` holds whatever the config references as `${NAME}`, stored as
+SecureString parameters. It runs exactly one task, on purpose: SQLite wants a
+single writer, and a monitor that runs twice sends every alert twice. The image
+is `distroless/static` running as non-root, built by the `Dockerfile`.
 
 ## Things worth opening
 
-**`internal/scheduler/scheduler.go`.** Start offsets, jitter and the no-overlap
-rule, driven by a `clock.Clock` so the tests move time by hand instead of
-sleeping.
-
-**`internal/store/store.go`.** The time-weighted uptime is a `LEAD()` window
-function with a cap, in one query. Writes go through one lock, reads run
-concurrently under WAL, and pruning deletes in batches so it never holds that
-lock for long.
-
-**`internal/incident/incident.go`.** Thirty lines that decide what an outage is.
-The test is a table of strings like `"---+-++"`.
-
-**`internal/monitor/monitor.go`.** The replay on startup, and the check that
-keeps a cancelled probe out of the history.
-
-**`internal/web/`.** A server-rendered page, `html/template` escaping, a strict
-Content Security Policy (the page loads nothing from anywhere else), and the
-Prometheus text format written by hand in a dozen lines.
+- **`internal/scheduler/scheduler.go`:** start offsets, jitter and the
+  no-overlap rule, on a fake clock so tests move time by hand.
+- **`internal/store/store.go`:** time-weighted uptime as one `LEAD()` window
+  query; one writer lock, concurrent reads under WAL, batched pruning.
+- **`internal/incident/incident.go`:** thirty lines that decide what an outage
+  is, tested with a table of strings like `"---+-++"`.
+- **`internal/web/`:** server-rendered page, a strict Content Security Policy,
+  and the Prometheus format written by hand in a dozen lines.
 
 ## Tests
 
-```bash
-go test -race ./...
-go test -run xxx -bench . ./internal/pool
-```
-
-61 tests (69 with subtests), all with the race detector on. The probes run
-against `httptest` servers and real sockets, including a TLS server whose
-certificate is checked for trust and expiry, and a chain whose intermediate
-expires before the leaf. A site that redirects forever to a URL full of Slack
-markup checks that the reason never carries it. The scheduler and the monitor run
-on a fake clock. The store is tested against real SQLite files: the uptime
-weighting, gaps, the p95 rank, batched pruning, and eight writers with four
-readers at once. The monitor tests restart on the same database mid-outage,
-after a simulated crash, and after three days of Pulse being down. The
-incident tests cover flapping and gaps; the notifier tests cover escaping,
-which statuses are retried, and one hung receiver next to a healthy one. Webhook signatures are checked against a vector
-computed outside Go. The page test feeds a check named `<script>` through the
-template.
+All tests run with the race detector. Probes run against `httptest` servers and
+real sockets, including a TLS chain whose intermediate expires first. The
+scheduler and monitor run on a fake clock; the store runs on real SQLite files,
+with eight writers and four readers at once; the monitor restarts mid-outage,
+after a crash, and after three days down. Webhook signatures are checked
+against a vector computed outside Go.
 
 ## Layout
 
 ```
-cmd/pulse/          run, check, demo
-internal/
-  config/           pulse.yaml, strict decoding, defaults
-  check/            http, tcp, dns, tls probes
-  clock/            real and fake time
-  pool/             bounded worker pool
-  scheduler/        start offsets, jitter, no overlap
-  store/            SQLite: results, incidents, uptime, retention
-  incident/         failure streaks to incidents
-  monitor/          wires the above, replay on startup
-  notify/           signed webhooks, Slack, background delivery
-  web/              status page, JSON, /metrics
-  demo/             fake services and ninety days of history
-infra/              ECS Fargate, EFS, ALB
+cmd/pulse/   run, check, demo
+internal/    config, check (http, tcp, dns, tls), clock, pool, scheduler,
+             store, incident, monitor, notify, web, demo
+infra/       ECS Fargate, EFS, ALB
 ```
 
 ## What's missing
 
-- One region. Probing from a single place cannot tell "the service is down"
-  from "the path from here is down"; multi-region would need agreement between
-  probes before opening an incident.
-- No maintenance windows. Planned downtime counts as downtime.
-- No auth on the page. It is meant to be public; anything private should not
-  be a check here.
-- The Docker image and the Terraform have been validated, not run: I have not
-  built the image or applied the stack against a real account.
+- One region, so it cannot tell "the service is down" from "the path from here is down".
+- No maintenance windows; planned downtime counts as downtime.
+- No auth on the page. It is meant to be public.
+- The Docker image and the Terraform are validated, not run against a real account.
