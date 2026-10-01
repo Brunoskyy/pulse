@@ -74,7 +74,7 @@ Pulse refuses to start until those are set, so export them or delete the
 
 | Command (repo root) | |
 | --- | --- |
-| `go test -race ./...` | 61 tests (69 with subtests) |
+| `go test -race ./...` | 63 tests (71 with subtests) |
 | `go test -run xxx -bench . ./internal/pool` | the worker pool benchmark |
 
 ## Configuration
